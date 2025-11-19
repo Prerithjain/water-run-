@@ -84,7 +84,7 @@ export default function ChartPanel({ people }: { people: Person[] }) {
                 ticks: {
                     font: {
                         family: "'Inter', sans-serif",
-                        weight: 'bold'
+                        weight: 'bold' as const
                     },
                     color: '#64748b'
                 },
