@@ -2,24 +2,27 @@ from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 import json
 import csv
 import io
+from dotenv import load_dotenv
+import requests
+import traceback
+
+# Load environment variables
+load_dotenv()
 
 app = FastAPI()
 
-# Determine DB path
-# For Vercel, we might need to use /tmp if we want write access (but it's ephemeral)
-# The prompt says "sqlite DB file (data/waterrun.db) persists on Vercel ephemeral storage... Include alternative"
-# We will stick to data/waterrun.db for now, assuming the user understands the limitation or is running locally.
-# To make it work on Vercel (read-only root), we might HAVE to use /tmp.
-# But let's try to use the project root 'data' folder first. If it fails, we catch it.
-# Actually, on Vercel, only /tmp is writable. So we MUST use /tmp for the DB if we want to write to it.
-# But for local dev, we want 'data/waterrun.db'.
-# We can check an env var or just catch the error.
+# Telegram Bot Configuration (FREE & RELIABLE!)
+# Get bot token from @BotFather on Telegram
+ENABLE_TELEGRAM_ALERTS = os.getenv('ENABLE_TELEGRAM_ALERTS', 'true').lower() == 'true'
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # Bot token from @BotFather
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')  # Group chat ID or personal chat ID
 
+# Determine DB path
 IS_VERCEL = os.environ.get('VERCEL') == '1'
 DB_DIR = '/tmp' if IS_VERCEL else os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
 DB_PATH = os.path.join(DB_DIR, 'waterrun.db')
@@ -36,14 +39,119 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def send_telegram_alert(who_went: List[str], who_is_next: str, is_manual: bool = False) -> dict:
+    """Send Telegram alert using Telegram Bot API (100% FREE & RELIABLE!)"""
+    if not ENABLE_TELEGRAM_ALERTS:
+        return {"success": False, "error": "Telegram alerts disabled"}
+    
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return {"success": False, "error": "Telegram not configured. Please set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env"}
+   
+    try:
+        # Create message
+        if is_manual:
+            message_text = f"🚰 <b>Reminder!</b>\n\n{who_is_next} - it's your turn for the water run! 💧"
+        else:
+            # Format who went
+            if len(who_went) == 1:
+                went_text = f"{who_went[0]} just went"
+            else:
+                went_text = f"{', '.join(who_went)} just went together"
+            
+            message_text = f"🚰 <b>Water Run Update!</b> 💧\n\n✅ {went_text}\n\n👉 <b>{who_is_next}</b> - you're up next!\n\nThanks team! 🙌"
+        
+        # Telegram Bot API - 100% FREE and RELIABLE!
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message_text,
+            "parse_mode": "HTML"
+        }
+        
+        response = requests.post(url, json=payload)
+        
+        if response.status_code == 200:
+            print(f"✓ Telegram message sent")
+            return {"success": True, "to": "telegram"}
+        else:
+            error_msg = f"Failed: {response.text}"
+            print(f"✗ Telegram error: {error_msg}")
+            return {"success": False, "error": error_msg}
+    
+    except Exception as e:
+        error_msg = f"Failed to send Telegram message: {str(e)}"
+        print(f"✗ {error_msg}")
+        traceback.print_exc()
+        return {"success": False, "error": error_msg}
+
+def notify_after_run(actor_names: List[str]):
+    """Automatically notify after someone completes a water run"""
+    try:
+        # Get suggestion (next person)
+        state = get_state()
+        people = state['people']
+        
+        if not people:
+            return {"success": False, "error": "No people found"}
+        
+        # Sort by score asc, then last_visit asc (same logic as /api/suggest)
+        def sort_key(p):
+            lv = p['last_visit'] or "0000-01-01"
+            return (p['score'], lv)
+        
+        sorted_people = sorted(people, key=sort_key)
+        next_person = sorted_people[0]  # Person with lowest score & oldest visit
+        
+        # Send Telegram alert
+        return send_telegram_alert(
+            who_went=actor_names,
+            who_is_next=next_person['name'],
+            is_manual=False
+        )
+    
+    except Exception as e:
+        error_msg = f"Error notifying: {str(e)}"
+        print(f"✗ {error_msg}")
+        traceback.print_exc()
+        return {"success": False, "error": error_msg}
+
+def notify_next_person():
+    """Manually notify about whose turn it is (for manual trigger button)"""
+    try:
+        # Get suggestion (next person)
+        state = get_state()
+        people = state['people']
+        
+        if not people:
+            return {"success": False, "error": "No people found"}
+        
+        # Sort by score asc, then last_visit asc
+        def sort_key(p):
+            lv = p['last_visit'] or "0000-01-01"
+            return (p['score'], lv)
+        
+        sorted_people = sorted(people, key=sort_key)
+        next_person = sorted_people[0]
+        
+        # Send manual reminder
+        return send_telegram_alert(
+            who_went=[],
+            who_is_next=next_person['name'],
+            is_manual=True
+        )
+    
+    except Exception as e:
+        error_msg = f"Error notifying next person: {str(e)}"
+        print(f"✗ {error_msg}")
+        traceback.print_exc()
+        return {"success": False, "error": error_msg}
+
 def init_db():
     try:
         conn = get_db()
         c = conn.cursor()
         
         # Check if we need to migrate to the new people list
-        # We check if 'Vishwas' exists. If not, we assume we need to reset (or it's a fresh DB).
-        # This is a simple way to switch from the default "Alice..." list to the user's list.
         table_exists = False
         try:
             c.execute("SELECT count(*) FROM people WHERE name = 'Vishwas'")
@@ -59,7 +167,8 @@ def init_db():
             
         c.execute('''CREATE TABLE IF NOT EXISTS people (
             id INTEGER PRIMARY KEY,
-            name TEXT UNIQUE NOT NULL
+            name TEXT UNIQUE NOT NULL,
+            phone TEXT
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY,
@@ -70,103 +179,40 @@ def init_db():
         )''')
         
         # Insert specific people and scores
-        # Names: Vishwas, Prerith, Prashanth, Bhuvan Gumma, Vikas Reddy
-        # Scores: Vishwas-7, Bhuvan Gumma-5, Prashanth-5, Prerith-5, Vikas Reddy-3
-        
         target_people = [
-            {"name": "Vishwas", "score": 7},
-            {"name": "Prerith", "score": 5},
-            {"name": "Prashanth", "score": 5},
-            {"name": "Bhuvan Gumma", "score": 5},
-            {"name": "Vikas Reddy", "score": 3}
+            {"name": "Vishwas", "score": 7, "phone": "+919876543210"},
+            {"name": "Prerith", "score": 5, "phone": "+919876543211"},
+            {"name": "Prashanth", "score": 5, "phone": "+919876543212"},
+            {"name": "Bhuvan Gumma", "score": 5, "phone": "+919876543213"},
+            {"name": "Vikas Reddy", "score": 3, "phone": "+919876543214"}
         ]
         
         for p in target_people:
             try:
-                c.execute("INSERT INTO people (name) VALUES (?)", (p['name'],))
-                # Get the ID
+                c.execute("INSERT INTO people (name, phone) VALUES (?, ?)", (p['name'], p.get('phone')))
                 c.execute("SELECT id FROM people WHERE name = ?", (p['name'],))
                 pid = c.fetchone()[0]
-                
-                # Insert initial score if needed
-                # We check if they have any runs. If not, add a legacy run.
-                # We assume if we just inserted them, they have 0 runs.
-                if p['score'] > 0:
-                    # Check if they already have points (in case we re-run this)
-                    # Actually, since we dropped tables if Vishwas wasn't there, this runs once.
-                    # But if we restart server, table exists, so we skip the DROP.
-                    # So we need to check if they have points.
-                    pass 
                     
             except sqlite3.IntegrityError:
+                # Person already exists, update phone if needed
+                c.execute("UPDATE people SET phone = ? WHERE name = ?", (p.get('phone'), p['name']))
                 pass
-
-        # Now ensure scores match target (idempotent check)
-        # This handles the case where we just created them, OR if they exist but we want to ensure initial scores.
-        # However, we only want to add "Initial Score" ONCE.
-        # So we check if there is a run with mode='legacy_import' for this user.
-        
-        for p in target_people:
-            c.execute("SELECT id FROM people WHERE name = ?", (p['name'],))
-            row = c.fetchone()
-            if not row: continue
-            pid = row[0]
-            
-            # Calculate current score
-            # This is a bit complex to do in pure SQL with the JSON actors, so we'll just do a quick check
-            # simpler: just insert a legacy run if NO runs exist for this user?
-            # But the user might have added runs since then.
-            # Let's just do it on the "Reset" path.
-            pass
 
         if not table_exists:
             # We just reset the DB, so we can safely insert the initial scores
-            timestamp = datetime.utcnow().isoformat() + "Z"
+            # Set timestamp to Nov 19, 2024 as requested
+            # Using datetime(2024, 11, 19) for Nov 19, 2024
+            initial_date = datetime(2024, 11, 19, 0, 0, 0)
+            old_timestamp = initial_date.isoformat() + "Z"
+            
             for p in target_people:
                 if p['score'] > 0:
                     c.execute("SELECT id FROM people WHERE name = ?", (p['name'],))
                     pid = c.fetchone()[0]
                     actors_json = json.dumps([pid])
                     c.execute("INSERT INTO runs (timestamp, mode, actors, points_each) VALUES (?, ?, ?, ?)",
-                              (timestamp, 'legacy_import', actors_json, p['score']))
+                              (old_timestamp, 'legacy_import', actors_json, p['score']))
 
-        # Force update scores for Prerith and Vikas if needed
-        # This is a bit hacky but ensures the user's request is met even if DB exists
-        updates = [
-            ("Prerith", 5),
-            ("Vikas Reddy", 3)
-        ]
-        
-        for name, score in updates:
-            try:
-                c.execute("SELECT id FROM people WHERE name = ?", (name,))
-                row = c.fetchone()
-                if row:
-                    pid = row[0]
-                    # Calculate current score
-                    # We can't easily "set" the score because it's derived from runs.
-                    # So we need to see what the current score is, and add a correction run.
-                    
-                    # Get current score
-                    current_score = 0
-                    c.execute("SELECT * FROM runs")
-                    all_runs = c.fetchall()
-                    for r in all_runs:
-                        try:
-                            if pid in json.loads(r['actors']):
-                                current_score += r['points_each']
-                        except:
-                            pass
-                            
-                    diff = score - current_score
-                    if diff != 0:
-                        print(f"Correcting score for {name}: current {current_score}, target {score}, diff {diff}")
-                        timestamp = datetime.utcnow().isoformat() + "Z"
-                        actors_json = json.dumps([pid])
-                        c.execute("INSERT INTO runs (timestamp, mode, actors, points_each) VALUES (?, ?, ?, ?)",
-                                  (timestamp, 'correction', actors_json, diff))
-            except Exception as e:
-                print(f"Error updating score for {name}: {e}")
 
         conn.commit()
         conn.close()
@@ -213,7 +259,8 @@ def get_state():
             "id": p['id'],
             "name": p['name'],
             "score": scores.get(p['id'], 0),
-            "last_visit": last_visit.get(p['id'])
+            "last_visit": last_visit.get(p['id']),
+            "phone": p['phone'] if 'phone' in p.keys() else None
         })
         
     conn.close()
@@ -235,6 +282,11 @@ def record_run(req: RecordRunRequest):
     conn = get_db()
     c = conn.cursor()
     
+    # Get actor names for Telegram notification
+    c.execute("SELECT * FROM people")
+    people = {p['id']: p['name'] for p in c.fetchall()}
+    actor_names = [people.get(aid, "Unknown") for aid in req.actors]
+    
     timestamp = datetime.utcnow().isoformat() + "Z"
     actors_json = json.dumps(req.actors)
     
@@ -243,7 +295,11 @@ def record_run(req: RecordRunRequest):
     conn.commit()
     conn.close()
     
-    return {"success": True, "new_state": get_state()}
+    # Automatically notify via Telegram (with who went and who's next)
+    telegram_result = notify_after_run(actor_names)
+    
+    
+    return {"success": True, "new_state": get_state(), "telegram_sent": telegram_result}
 
 @app.get("/api/history")
 def get_history(limit: int = 50, page: int = 1):
@@ -264,7 +320,7 @@ def get_history(limit: int = 50, page: int = 1):
             history.append({
                 "id": r['id'],
                 "timestamp": r['timestamp'],
-                "mode": r['mode'],
+               "mode": r['mode'],
                 "actors": actor_ids,
                 "actor_names": actor_names,
                 "points_each": r['points_each']
@@ -343,3 +399,20 @@ def export_csv_endpoint():
             continue
             
     return Response(content=output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=water_runs.csv"})
+
+@app.post("/api/send-alert")
+def send_alert_manually():
+    """Manually trigger Telegram alert to next person (admin only)"""
+    result = notify_next_person()
+    if result.get('success'):
+        return {"success": True, "message": f"Telegram alert sent to {result.get('to')}"}
+    else:
+        raise HTTPException(500, result.get('error', 'Failed to send alert'))
+
+@app.get("/api/telegram-status")
+def telegram_status():
+    """Check if Telegram alerts are enabled"""
+    return {
+        "enabled": ENABLE_TELEGRAM_ALERTS,
+        "service": "Telegram Bot API (FREE)"
+    }

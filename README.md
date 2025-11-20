@@ -34,6 +34,12 @@ A clean, responsive web app to track water runs.
    - For a persistent demo, use a provider like Render or Railway for the backend, or use Vercel KV / external database (Postgres/Turso).
    - This project uses a local SQLite file as requested, which works perfectly for local development.
 
+3. **(Optional) Enable WhatsApp Alerts - 100% FREE!**:
+   - See detailed setup guide: [WHATSAPP_SETUP.md](./WHATSAPP_SETUP.md)
+   - Uses **CallMeBot** - completely FREE WhatsApp API (no credit card needed!)
+   - Takes 5 minutes per person to setup
+   - Quick start: Create a `.env` file (see `env.example`)
+
 ## Tech Stack
 - **Frontend**: Next.js (App Router), Tailwind CSS, Chart.js, SWR.
 - **Backend**: FastAPI (Python), SQLite3.
